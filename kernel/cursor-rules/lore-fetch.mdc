@@ -1,0 +1,31 @@
+---
+description: Use semcode MCP for lore.kernel.org content - triggered when user provides lore URLs, Message-IDs, asks about mailing list discussion, or wants to review patch feedback
+globs:
+alwaysApply: false
+---
+
+# Fetching lore.kernel.org content
+
+When the user provides a lore.kernel.org URL, a Message-ID, or asks about
+mailing list discussion of a patch:
+
+## Priority order
+
+1. **semcode MCP** -- extract Message-ID from the URL and call
+   `lore_search(message_id="<id>", verbose=true)`.
+   For threads: add `show_replies=true`.
+   For commit lookup: use `dig(commit="<ref>", verbose=true)`.
+2. **scripts/lore-fetch** -- fallback if MCP fails. It tries semcode
+   internally, then falls back to b4.
+
+## Extracting Message-ID from URLs
+
+`https://lore.kernel.org/<list>/<msgid>/` -- the Message-ID is `<msgid>`.
+Strip any trailing `/` or `/raw`.
+
+## NEVER do this
+
+- **NEVER** `WebFetch` / `curl` / `wget` a lore URL directly -- raw
+  emails waste ~50% of tokens on routing headers (DKIM, ARC, Received).
+- **NEVER** run `b4 am` / `b4 mbox` and read the output directly --
+  same header bloat. Use semcode or lore-fetch which strip headers.

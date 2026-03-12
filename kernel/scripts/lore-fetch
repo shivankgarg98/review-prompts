@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Fetch lore.kernel.org emails with clean output for AI tools.
+
+Tries semcode first (fast, local, already header-stripped), falls back
+to b4 if semcode is unavailable or the message isn't indexed.
+
+Usage:
+    lore-fetch <URL-or-Message-ID>
+    lore-fetch --thread <URL-or-Message-ID>
+    lore-fetch --thread --patches-only <URL-or-Message-ID>
+    lore-fetch --b4 <URL-or-Message-ID>          # skip semcode, go straight to b4
+
+Examples:
+    lore-fetch "https://lore.kernel.org/kvm/20260126164445.11867-1-kalyazin@amazon.com/"
+    lore-fetch 20260126164445.11867-1-kalyazin@amazon.com
+    lore-fetch --thread 20260126164445.11867-1-kalyazin@amazon.com
+    lore-fetch --thread --patches-only 20260126164445.11867-1-kalyazin@amazon.com
+
+Output goes to stdout with headers stripped for clean context ingestion.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from email import policy
+from email.parser import BytesParser
+
+
+def extract_message_id(arg: str) -> str:
+    """Extract Message-ID from a lore URL or bare Message-ID."""
+    arg = arg.strip().rstrip("/")
+
+    m = re.search(r'lore\.kernel\.org/[^/]+/([^/?#]+)', arg)
+    if m:
+        return m.group(1)
+
+    if "@" in arg or (len(arg) > 20 and "." in arg):
+        return arg.strip("<>")
+
+    print(f"Error: cannot extract Message-ID from: {arg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_mbox(path: str):
+    """Yield parsed email messages from an mbox file."""
+    with open(path, "rb") as f:
+        content = f.read()
+
+    parts = re.split(rb'^From ', content, flags=re.MULTILINE)
+    for i, chunk in enumerate(parts):
+        if i == 0 and not chunk.strip():
+            continue
+        if i > 0:
+            chunk = b'From ' + chunk
+        try:
+            yield BytesParser(policy=policy.default).parsebytes(chunk)
+        except Exception:
+            continue
+
+
+def is_patch(subject: str) -> bool:
+    """Return True if subject looks like a patch (has [PATCH ...])."""
+    return bool(re.search(r'\[PATCH', subject, re.IGNORECASE))
+
+
+def format_message(msg, include_headers: bool = True) -> str:
+    """Format a single email message for output."""
+    lines = []
+
+    if include_headers:
+        for hdr in ("From", "Date", "Subject", "Message-ID",
+                     "In-Reply-To", "References"):
+            val = msg.get(hdr)
+            if val:
+                lines.append(f"{hdr}: {val}")
+        lines.append("")
+
+    body = msg.get_body(preferencelist=("plain",))
+    if body:
+        lines.append(body.get_content())
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            lines.append(payload.decode("utf-8", errors="replace"))
+
+    return "\n".join(lines)
+
+
+def find_mbox_in_tree(root: str) -> str | None:
+    """Recursively find the first .mbx or .mbox file under root."""
+    for dirpath, _dirs, files in os.walk(root):
+        for f in sorted(files):
+            if f.endswith((".mbx", ".mbox")):
+                return os.path.join(dirpath, f)
+    return None
+
+
+def have_semcode() -> bool:
+    """Check if the semcode CLI is available."""
+    return shutil.which("semcode") is not None
+
+
+def fetch_semcode_single(msgid: str) -> str | None:
+    """Try fetching a single email via semcode lore_search."""
+    try:
+        result = subprocess.run(
+            ["semcode", "-q", f"lore -m {msgid} -v"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            print("[lore-fetch] fetched via semcode", file=sys.stderr)
+            return result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return None
+
+
+def fetch_semcode_thread(msgid: str, patches_only: bool = False) -> str | None:
+    """Try fetching a thread via semcode lore_search with show_replies."""
+    try:
+        cmd = f"lore -m {msgid} -v --replies"
+        result = subprocess.run(
+            ["semcode", "-q", cmd],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            if patches_only:
+                lines = result.stdout.split("\n---\n")
+                filtered = []
+                for block in lines:
+                    first_line = block.lstrip().split("\n", 1)[0]
+                    if "Subject:" in first_line and not is_patch(first_line):
+                        continue
+                    filtered.append(block)
+                if filtered:
+                    print("[lore-fetch] fetched thread via semcode "
+                          f"({len(filtered)} messages)", file=sys.stderr)
+                    return "\n---\n".join(filtered)
+            else:
+                print("[lore-fetch] fetched thread via semcode", file=sys.stderr)
+                return result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return None
+
+
+def fetch_b4_single(msgid: str) -> str:
+    """Fetch a single patch via b4 am."""
+    tmpdir = tempfile.mkdtemp(prefix="lore-fetch-")
+    outdir = os.path.join(tmpdir, "out")
+    try:
+        result = subprocess.run(
+            ["b4", "am", "-o", outdir, msgid],
+            capture_output=True, text=True,
+        )
+        mbox = find_mbox_in_tree(tmpdir)
+
+        if mbox and os.path.getsize(mbox) > 0:
+            output = []
+            cover = mbox.rsplit(".", 1)[0] + ".cover"
+            if os.path.exists(cover):
+                with open(cover, "r") as f:
+                    output.append(f.read().strip())
+            for msg in parse_mbox(mbox):
+                output.append(format_message(msg))
+            if output:
+                return "\n---\n".join(output)
+
+        if result.stdout.strip():
+            return result.stdout
+        print(f"b4 am produced no output for {msgid}", file=sys.stderr)
+        if result.stderr.strip():
+            print(result.stderr, file=sys.stderr)
+        sys.exit(1)
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def fetch_b4_thread(msgid: str, patches_only: bool = False) -> str:
+    """Fetch full thread via b4 mbox."""
+    tmpdir = tempfile.mkdtemp(prefix="lore-fetch-")
+    try:
+        result = subprocess.run(
+            ["b4", "mbox", "-o", tmpdir, msgid],
+            capture_output=True, text=True,
+        )
+        mbox_path = find_mbox_in_tree(tmpdir)
+        if not mbox_path:
+            print(f"b4 mbox produced no output for {msgid}", file=sys.stderr)
+            if result.stderr.strip():
+                print(result.stderr, file=sys.stderr)
+            sys.exit(1)
+
+        output = []
+        for msg in parse_mbox(mbox_path):
+            subject = str(msg.get("Subject", ""))
+            if patches_only and not is_patch(subject):
+                continue
+            output.append(format_message(msg))
+
+        if not output:
+            print("No matching messages found in thread", file=sys.stderr)
+            sys.exit(1)
+        return "\n---\n".join(output)
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def fetch_single(msgid: str, skip_semcode: bool = False) -> str:
+    """Fetch a single email: semcode first, then b4."""
+    if not skip_semcode and have_semcode():
+        result = fetch_semcode_single(msgid)
+        if result:
+            return result
+        print("[lore-fetch] semcode failed or message not indexed, "
+              "falling back to b4", file=sys.stderr)
+    return fetch_b4_single(msgid)
+
+
+def fetch_thread(msgid: str, patches_only: bool = False,
+                 skip_semcode: bool = False) -> str:
+    """Fetch a thread: semcode first, then b4."""
+    if not skip_semcode and have_semcode():
+        result = fetch_semcode_thread(msgid, patches_only)
+        if result:
+            return result
+        print("[lore-fetch] semcode failed or message not indexed, "
+              "falling back to b4", file=sys.stderr)
+    return fetch_b4_thread(msgid, patches_only)
+
+
+def main():
+    thread = False
+    patches_only = False
+    skip_semcode = False
+    args = sys.argv[1:]
+
+    while args and args[0].startswith("-"):
+        if args[0] == "--thread":
+            thread = True
+            args = args[1:]
+        elif args[0] == "--patches-only":
+            patches_only = True
+            args = args[1:]
+        elif args[0] == "--b4":
+            skip_semcode = True
+            args = args[1:]
+        elif args[0] in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            print(f"Unknown option: {args[0]}", file=sys.stderr)
+            sys.exit(1)
+
+    if len(args) != 1:
+        print("Usage: lore-fetch [--thread] [--patches-only] [--b4] "
+              "<URL-or-Message-ID>", file=sys.stderr)
+        sys.exit(1)
+
+    msgid = extract_message_id(args[0])
+
+    if thread:
+        print(fetch_thread(msgid, patches_only, skip_semcode))
+    else:
+        print(fetch_single(msgid, skip_semcode))
+
+
+if __name__ == "__main__":
+    main()

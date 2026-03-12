@@ -50,6 +50,17 @@ When available, use semcode MCP tools for efficient code navigation:
 - `grep_functions`: Search function bodies
 - `diff_functions`: Identify changed functions in patches
 
+### Lore, Commit History, and Search Tools
+
+- `lore_search`: Fetch lore emails by message_id, subject, or author
+- `dig`: Find lore emails related to a git commit
+- `vlore_similar_emails`: Semantic search over lore archives
+- `find_commit`: Look up commits by ref or symbol pattern
+- `vcommit_similar_commits`: Semantic search over commit history
+
+For lore content from the CLI, use `scripts/lore-fetch` which tries
+semcode first and falls back to b4 automatically.
+
 ## Output
 
 - Patch reviews produce `review-inline.txt` when regressions are found
